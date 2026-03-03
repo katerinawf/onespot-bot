@@ -1,6 +1,6 @@
 """
 Телеграм-бот для расчёта партнёрского вознаграждения OneSpot.
-Установка: pip install python-telegram-bot==21.3
+Установка: pip install python-telegram-bot==21.9
 Запуск: python3.11 bot.py
 """
 
