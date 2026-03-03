@@ -1,7 +1,9 @@
 """
 Телеграм-бот для расчёта партнёрского вознаграждения OneSpot.
-Установка: pip install python-telegram-bot==21.9
-Запуск: python3.11 bot.py
+Railway: добавь переменную окружения BOT_TOKEN и старт-команду `python bot.py`
+
+Установка локально: pip install python-telegram-bot==21.9
+Запуск локально: python3 bot.py
 """
 
 import os
@@ -10,6 +12,7 @@ import logging
 from datetime import datetime, time
 from collections import defaultdict
 from urllib.parse import quote
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -20,21 +23,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MANAGER_USERNAME = "k_onespot"
-MANAGER_CHAT_ID = -1003651651617  # Чат для логов
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден. Добавь BOT_TOKEN в Railway → Variables")
 
-REMINDER_INTERVAL = 30 * 60  # 30 минут в секундах
+MANAGER_USERNAME = "k_onespot"
+MANAGER_CHAT_ID = -1003651651617  # Чат для логов (можно оставить как есть)
+
+REMINDER_INTERVAL = 30 * 60  # 30 минут
 MAX_REMINDERS = 3
+
+REGISTRATION_URL_SMALL_BUDGET = (
+    "https://onespot.one/bonus-for-friend?utm_source=bot&utm_medium=refferal_program"
+)
+SMALL_BUDGET_THRESHOLD = 150_000  # если оборот/бюджет меньше — ведем на сайт
+
 
 # ─── Статистика за день ───────────────────────────────────────────────────────
 stats = {
-    "opens": 0,           # Открытий бота
-    "completed": 0,       # Завершённых расчётов
-    "abandoned": 0,       # Брошенных расчётов
-    "kb_visits": 0,       # Переходов в базу знаний
-    "users": [],          # Список пользователей
-    "grades": defaultdict(int),  # Расчётов по грейдам
+    "opens": 0,
+    "completed": 0,
+    "abandoned": 0,
+    "kb_visits": 0,
+    "users": [],
+    "grades": defaultdict(int),
 }
+
 
 def reset_stats():
     global stats
@@ -47,8 +60,10 @@ def reset_stats():
         "grades": defaultdict(int),
     }
 
+
 # ─── База данных ─────────────────────────────────────────────────────────────
 DB_PATH = "onespot.db"
+
 
 def db_init():
     """Создать таблицы если не существуют"""
@@ -101,8 +116,10 @@ def db_track_user(user_id: int, username: str):
             last_seen=excluded.last_seen,
             opens=opens+1
     """, (user_id, username, now, now))
-    c.execute("INSERT INTO events (user_id, username, event_type, created_at) VALUES (?, ?, 'open', ?)",
-              (user_id, username, now))
+    c.execute(
+        "INSERT INTO events (user_id, username, event_type, created_at) VALUES (?, ?, 'open', ?)",
+        (user_id, username, now)
+    )
     conn.commit()
     conn.close()
 
@@ -116,8 +133,10 @@ def db_track_calc(user_id: int, username: str, grade: str, turnover: float, rewa
         INSERT INTO calculations (user_id, username, grade, turnover, total_reward_max, platforms, completed_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (user_id, username, grade, turnover, reward, platforms, now))
-    c.execute("INSERT INTO events (user_id, username, event_type, created_at) VALUES (?, ?, 'completed', ?)",
-              (user_id, username, now))
+    c.execute(
+        "INSERT INTO events (user_id, username, event_type, created_at) VALUES (?, ?, 'completed', ?)",
+        (user_id, username, now)
+    )
     conn.commit()
     conn.close()
 
@@ -127,8 +146,10 @@ def db_track_event(user_id: int, username: str, event_type: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("INSERT INTO events (user_id, username, event_type, created_at) VALUES (?, ?, ?, ?)",
-              (user_id, username, event_type, now))
+    c.execute(
+        "INSERT INTO events (user_id, username, event_type, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, username, event_type, now)
+    )
     conn.commit()
     conn.close()
 
@@ -164,8 +185,12 @@ def db_get_daily_stats(date_str: str) -> dict:
 
     conn.close()
     return {
-        "opens": opens, "completed": completed, "abandoned": abandoned,
-        "kb_visits": kb_visits, "users": users, "grades": grades
+        "opens": opens,
+        "completed": completed,
+        "abandoned": abandoned,
+        "kb_visits": kb_visits,
+        "users": users,
+        "grades": grades
     }
 
 
@@ -173,68 +198,68 @@ def db_get_daily_stats(date_str: str) -> dict:
 (WELCOME, SELECT_YANDEX, SELECT_OTHER, ENTER_TOTAL_TURNOVER, ENTER_BUDGET,
  ENTER_CLIENTS, ENTER_MEDIA, SHOW_RESULT, KNOWLEDGE_BASE) = range(9)
 
-# ─── Тиры оборота ────────────────────────────────────────────────────────────
+# ─── Тиры оборота (как в таблице на скрине) ──────────────────────────────────
 TIERS = [
     (1, 500_000),
-    (500_001, 1_000_000),
+    (501_000, 1_000_000),
     (1_000_001, 3_000_000),
     (3_000_001, 5_000_000),
-    (5_000_001, 10_000_000),
-    (10_000_001, None),
+    (5_000_001, None),
 ]
 
-# ─── Ставки по площадкам ─────────────────────────────────────────────────────
+# ─── Ставки по площадкам (обновлено) ─────────────────────────────────────────
+# Формат: список из 5 элементов (по количеству TIERS), каждый элемент (min%, max%)
 RATES = {
     "Яндекс: Поиск": [
-        (0, 4), (4.5, 4.5), (5, 5), (5.5, 5.5), (5.5, 5.5), (0, 6)
+        (0, 4), (4.5, 4.5), (5, 5), (5.5, 5.5), (0, 6)
     ],
     "Яндекс: РСЯ": [
-        (0, 6), (6, 6), (7.5, 7.5), (0, 8.5), (9, 9), (9, 9)
-    ],
-    "Яндекс: Продвижение приложений": [
-        (10, 10), (13, 13), (15, 15), (0, 19), (20, 20), (26, 26)
+        (0, 6), (7, 7), (7.5, 7.5), (0, 8.5), (9, 9)
     ],
     "Яндекс: ECOM (+к РСЯ/Поиск)": [
-        (5, 5), (7, 7), (0, 9), (0, 11), (12, 12), (13, 13)
+        (5, 5), (7, 7), (0, 9), (0, 11), (0, 13)
+    ],
+    "Яндекс: Продвижение приложений": [
+        (10, 10), (13, 13), (15, 15), (0, 19), (0, 26)
     ],
     "Яндекс: Медийка": [
-        (5, 5), (7, 7), (9, 9), (0, 11), (11.5, 11.5), (12, 12)
+        (5, 5), (7, 7), (9, 9), (0, 11), (0, 12)
     ],
     "Яндекс: Видеореклама": [
-        (5, 5), (7, 7), (9, 9), (0, 11), (11.5, 11.5), (12, 12)
+        (5, 5), (7, 7), (9, 9), (0, 11), (0, 12)
     ],
     "Яндекс: Медийка в картах": [
-        (5, 5), (8, 8), (10, 12), (0, 16), (17, 17), (26, 26)
+        (5, 5), (8, 8), (10, 12), (0, 16), (0, 26)
     ],
     "Яндекс: Промостраницы": [
-        (4, 4), (8, 8), (10, 10), (0, 12), (13, 13), (13, 13)
+        (4, 4), (8, 8), (10, 10), (0, 12), (0, 13)
     ],
     "Яндекс: Реклама в ТГ-каналах": [
-        (1, 1), (2, 2), (2, 2), (0, 3.5), (3.5, 3.5), (4, 4)
+        (1, 1), (2, 2), (2, 2), (0, 3.5), (0, 4)
     ],
     "Telegram Ads": [
-        (3, 3), (3.5, 3.5), (4, 4), (5, 5), (5, 5), (5, 5)
+        (3, 3), (3.5, 3.5), (4, 4), (5, 5), (5, 5)
     ],
     "Таргетированная реклама": [
-        (0, 8), (0, 8), (0, 8), (0, 12), (0, 12), (0, 12)
+        (0, 8), (0, 8), (0, 8), (0, 21), (0, 21)
     ],
     "Авито объявления": [
-        (3, 3), (5, 5), (6, 6), (0, 8), (0, 8), (0, 8)
+        (3, 3), (5, 5), (6, 6), (0, 8), (0, 8)
     ],
     "Авито реклама": [
-        (0, 13), (13.5, 13.5), (13.5, 13.5), (15, 15), (15, 15), (15, 15)
+        (0, 13), (13.5, 13.5), (13.5, 13.5), (15, 15), (15, 15)
     ],
     "Telega.in": [
-        (0, 2), (2, 2), (3, 3), (0, 4), (0, 4), (0, 4)
+        (0, 2), (2, 2), (3, 3), (0, 4), (0, 4)
     ],
     "TikTok Home Reg": [
-        (0, 0), (0, 6), (0, 6), (0, 6), (0, 6), (0, 6)
+        (0, 0), (0, 6), (0, 6), (0, 6), (0, 6)
     ],
     "Ozon": [
-        (0, 17), (17, 17), (20, 20), (25, 25), (25, 25), (25, 25)
+        (0, 17), (17, 17), (20, 20), (25, 25), (25, 25)
     ],
     "Wildberries": [
-        (0, 0), (0, 0), (12, 12), (15, 15), (15, 15), (15, 15)
+        (0, 0), (0, 0), (12, 12), (15, 15), (15, 15)
     ],
 }
 
@@ -308,7 +333,6 @@ KNOWLEDGE = {
 
 
 # ─── Вспомогательные функции ─────────────────────────────────────────────────
-
 def get_tier_index(turnover: float) -> int:
     for i, (lo, hi) in enumerate(TIERS):
         if hi is None or turnover <= hi:
@@ -352,10 +376,7 @@ def fmt_range(mn: float, mx: float) -> str:
 
 
 def manager_btn() -> list:
-    return [InlineKeyboardButton(
-        "📞 Связаться с менеджером",
-        url=f"tg://resolve?domain={MANAGER_USERNAME}"
-    )]
+    return [InlineKeyboardButton("📞 Связаться с менеджером", url=f"tg://resolve?domain={MANAGER_USERNAME}")]
 
 
 def log_user(user) -> str:
@@ -372,12 +393,12 @@ async def notify_manager(app, text: str):
             logger.error(f"Не удалось отправить лог менеджеру: {e}")
 
 
+# ─── Джобы ───────────────────────────────────────────────────────────────────
 async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневный отчёт в 20:00"""
     today = datetime.now().strftime("%Y-%m-%d")
     today_display = datetime.now().strftime("%d.%m.%Y")
 
-    # Берём данные из БД
     db_stats = db_get_daily_stats(today)
 
     users_list = "\n".join(f"  • {u}" for u in db_stats["users"]) if db_stats["users"] else "  нет"
@@ -409,18 +430,18 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.data["chat_id"]
     reminder_num = job.data["reminder_num"]
-    user_info = job.data["user_info"]
+    user_id = job.data["user_id"]
+    username = job.data["username"]
 
     reminder_num += 1
     job.data["reminder_num"] = reminder_num
 
     if reminder_num > MAX_REMINDERS:
-        # Логируем что так и не завершил
         stats["abandoned"] += 1
-        db_track_event(job.data["chat_id"], user_info, "abandoned")
+        db_track_event(user_id, username, "abandoned")
         await notify_manager(
             context.application,
-            f"❌ Пользователь {user_info} бросил расчёт и не вернулся после {MAX_REMINDERS} напоминаний"
+            f"❌ Пользователь {username} (id={user_id}) бросил расчёт и не вернулся после {MAX_REMINDERS} напоминаний"
         )
         return
 
@@ -438,26 +459,26 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             ),
             reply_markup=keyboard
         )
-        logger.info(f"Напоминание #{reminder_num} отправлено: {user_info}")
+        logger.info(f"Напоминание #{reminder_num} отправлено: {username} (id={user_id})")
 
         if reminder_num < MAX_REMINDERS:
             context.job_queue.run_once(
                 reminder_job,
                 REMINDER_INTERVAL,
-                data={"chat_id": chat_id, "reminder_num": reminder_num, "user_info": user_info},
+                data={"chat_id": chat_id, "user_id": user_id, "username": username, "reminder_num": reminder_num},
                 name=f"reminder_{chat_id}"
             )
     except Exception as e:
         logger.error(f"Ошибка напоминания: {e}")
 
 
-def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_info: str):
+def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, username: str):
     """Запланировать напоминания"""
     cancel_reminders(context, chat_id)
     context.job_queue.run_once(
         reminder_job,
         REMINDER_INTERVAL,
-        data={"chat_id": chat_id, "reminder_num": 0, "user_info": user_info},
+        data={"chat_id": chat_id, "user_id": user_id, "username": username, "reminder_num": 0},
         name=f"reminder_{chat_id}"
     )
 
@@ -470,7 +491,6 @@ def cancel_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 
 # ─── Построение итогового сообщения ──────────────────────────────────────────
-
 def build_summary(context: ContextTypes.DEFAULT_TYPE, user) -> tuple:
     tier_idx = context.user_data["tier_idx"]
     total_turnover = context.user_data["total_turnover"]
@@ -479,8 +499,6 @@ def build_summary(context: ContextTypes.DEFAULT_TYPE, user) -> tuple:
     clients = context.user_data.get("clients", "не указано")
     media = context.user_data.get("media", "не указано")
 
-    username = f"@{user.username}" if user.username else user.full_name
-    user_id = user.id
     turnover_str = fmt_money(total_turnover)
 
     ecom_selected = ECOM_IDX in selected_list
@@ -545,7 +563,10 @@ def build_summary(context: ContextTypes.DEFAULT_TYPE, user) -> tuple:
     total_budgets = sum(budgets.get(i, 0) for i in selected_list)
     if abs(total_budgets - total_turnover) / max(total_turnover, 1) > 0.05:
         total_budgets_str = fmt_money(total_budgets)
-        footer = f"\n⚠️ Сумма бюджетов ({total_budgets_str}) не совпадает с указанным оборотом ({turnover_str}). Финальный расчёт согласует менеджер."
+        footer = (
+            f"\n⚠️ Сумма бюджетов ({total_budgets_str}) не совпадает с указанным оборотом ({turnover_str}). "
+            f"Финальный расчёт согласует менеджер."
+        )
     else:
         footer = "\n⚠️ Оборот — лишь один из факторов. Финальные условия согласует менеджер."
 
@@ -568,34 +589,33 @@ def build_summary(context: ContextTypes.DEFAULT_TYPE, user) -> tuple:
         "📌 Площадки и бюджеты:",
         *manager_lines,
         f"\n💎 Расчётное вознаграждение: ~{total_str}",
-
     ])
 
     return user_msg, manager_msg
 
 
 # ─── Хэндлеры ────────────────────────────────────────────────────────────────
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["selected"] = set()
+
     user = update.effective_user
-    user_info = log_user(user)
-    logger.info(f"Новый пользователь: {user_info}")
-
-    # Запускаем напоминания если не завершит
-    schedule_reminder(context, update.effective_chat.id, user_info)
-
-    # Статистика
-    stats["opens"] += 1
     username_display = f"@{user.username}" if user.username else f"id:{user.id}"
+
+    logger.info(f"Новый пользователь: {log_user(user)}")
+
+    # напоминания (если не завершит)
+    schedule_reminder(context, update.effective_chat.id, user.id, username_display)
+
+    # статистика
+    stats["opens"] += 1
     if username_display not in stats["users"]:
         stats["users"].append(username_display)
     db_track_user(user.id, username_display)
 
     await notify_manager(
         context.application,
-        f"👀 Новый пользователь открыл бота: {user_info} — {datetime.now().strftime('%d.%m %H:%M')}"
+        f"👀 Новый пользователь открыл бота: {log_user(user)} — {datetime.now().strftime('%d.%m %H:%M')}"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -627,13 +647,13 @@ async def welcome_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "go_kb":
         stats["kb_visits"] += 1
         user = update.effective_user
-        db_track_event(user.id, f"@{user.username}" if user.username else f"id:{user.id}", "kb_visit")
+        username_display = f"@{user.username}" if user.username else f"id:{user.id}"
+        db_track_event(user.id, username_display, "kb_visit")
         await show_kb_main(update, context, edit=True)
         return KNOWLEDGE_BASE
 
 
 # ─── База знаний ─────────────────────────────────────────────────────────────
-
 async def show_kb_main(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=True):
     kb = KNOWLEDGE["kb_main"]
     keyboard = []
@@ -669,7 +689,6 @@ async def kb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data in KNOWLEDGE:
         kb = KNOWLEDGE[data]
-        stats["kb_visits"] += 1
         keyboard = [
             [InlineKeyboardButton("⬅️ Назад", callback_data="kb_back")],
             [InlineKeyboardButton("🧮 Рассчитать вознаграждение", callback_data="go_calc")],
@@ -684,7 +703,6 @@ async def kb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Калькулятор ─────────────────────────────────────────────────────────────
-
 async def show_yandex_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=True):
     selected: set = context.user_data.get("selected", set())
     keyboard = []
@@ -832,6 +850,18 @@ async def enter_total_turnover(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ENTER_TOTAL_TURNOVER
 
+    # если меньше 150к — ведем на сайт и завершаем диалог
+    if turnover < SMALL_BUDGET_THRESHOLD:
+        await update.message.reply_text(
+            "💡 Для бюджетов до 150 000 ₽ регистрация проходит через сайт.\n\n"
+            "Перейдите по ссылке и зарегистрируйтесь в программе:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Зарегистрироваться", url=REGISTRATION_URL_SMALL_BUDGET)]
+            ])
+        )
+        cancel_reminders(context, update.effective_chat.id)
+        return ConversationHandler.END
+
     context.user_data["total_turnover"] = turnover
     context.user_data["tier_idx"] = get_tier_index(turnover)
     context.user_data["budgets"] = {}
@@ -927,26 +957,26 @@ async def media_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["media"] = "нет"
-    await finish_calc(query.message, context, update.effective_user, edit=False)
+    await finish_calc(query.message, context, update.effective_user)
     return SHOW_RESULT
 
 
 async def enter_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["media"] = update.message.text.strip()
-    await finish_calc(update.message, context, update.effective_user, edit=False)
+    await finish_calc(update.message, context, update.effective_user)
     return SHOW_RESULT
 
 
-async def finish_calc(message, context: ContextTypes.DEFAULT_TYPE, user, edit=False):
+async def finish_calc(message, context: ContextTypes.DEFAULT_TYPE, user):
     user_info = log_user(user)
     logger.info(f"Расчёт завершён: {user_info}")
 
-    # Отменяем напоминания — человек дошёл до конца
+    # отменяем напоминания — дошёл до конца
     cancel_reminders(context, message.chat_id)
 
     user_msg, manager_msg = build_summary(context, user)
 
-    # Статистика
+    # статистика
     stats["completed"] += 1
     tier_idx = context.user_data.get("tier_idx", 0)
     grade = tier_label(tier_idx)
@@ -963,8 +993,8 @@ async def finish_calc(message, context: ContextTypes.DEFAULT_TYPE, user, edit=Fa
         context.application,
         f"✅ Расчёт завершён: {user_info} — {datetime.now().strftime('%d.%m %H:%M')}\n\n{user_msg}"
     )
-    tg_link = f"tg://resolve?domain={MANAGER_USERNAME}&text={quote(manager_msg)}"
 
+    tg_link = f"tg://resolve?domain={MANAGER_USERNAME}&text={quote(manager_msg)}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📨 Отправить менеджеру", url=tg_link)],
         [InlineKeyboardButton("📚 Узнать больше о программе", callback_data="go_kb_result")],
@@ -996,12 +1026,12 @@ async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cancel_reminders(context, update.effective_chat.id)
     await update.message.reply_text("Расчёт отменён. Напишите /start чтобы начать заново.")
     return ConversationHandler.END
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
-
 def main():
     db_init()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1022,7 +1052,10 @@ def main():
             SHOW_RESULT: [CallbackQueryHandler(result_callback)],
             KNOWLEDGE_BASE: [CallbackQueryHandler(kb_callback)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(result_callback, pattern="^reminder_continue$")],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(result_callback, pattern="^reminder_continue$")
+        ],
         per_message=False,
     )
 
